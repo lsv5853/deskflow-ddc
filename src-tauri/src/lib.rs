@@ -1,5 +1,6 @@
 pub mod diagnostics;
 pub mod discovery;
+pub mod emergency;
 pub mod engine;
 #[cfg(target_os = "macos")]
 pub mod engine_guard;
