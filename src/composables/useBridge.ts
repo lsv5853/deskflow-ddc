@@ -23,6 +23,7 @@ function previewSnapshot(): Snapshot {
     pairingCode: '',
     hasSavedPairing: false,
     dependencies: { deskflow: false, displayControl: false, accessibility: false },
+    engineTcc: { verdict: 'notApplicable', detail: '', binaryPath: '', appTrusted: false },
     logs: [],
     lastError: null,
     preview: true,
