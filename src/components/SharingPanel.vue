@@ -29,6 +29,17 @@ const label = (value: string) =>
     .replace('alt', 'Alt')
     .replace('shift', 'Shift')
     .replaceAll('+', ' + ')
+const emergencyShortcuts = computed(() => [
+  ...(draft.emergencyShortcut &&
+  !['control+alt+shift+F9', 'control+alt+shift+F10', 'control+alt+shift+F11'].includes(
+    draft.emergencyShortcut,
+  )
+    ? [draft.emergencyShortcut]
+    : []),
+  'control+alt+shift+F9',
+  'control+alt+shift+F10',
+  'control+alt+shift+F11',
+])
 </script>
 <template>
   <section>
@@ -72,6 +83,34 @@ const label = (value: string) =>
           </div>
           <kbd>Ctrl + Alt + Esc</kbd>
         </div>
+        <label class="field"
+          ><span>紧急停止共享（引擎无响应时强制结束）</span
+          ><select v-model="draft.emergencyShortcut" :disabled="locked || !isHost">
+            <option
+              v-for="shortcut in emergencyShortcuts"
+              :key="shortcut"
+              :value="shortcut"
+            >
+              {{ label(shortcut) }}
+            </option>
+          </select></label
+        >
+        <div class="inline-info">
+          紧急快捷键不经过键鼠引擎：按下后直接结束引擎并恢复本地输入。引擎连续
+          {{ draft.emergencyTimeoutSecs }} 秒无响应时也会自动停止（设为 0 则只保留手动紧急停止）。
+        </div>
+        <label class="field small-field"
+          ><span>引擎无响应自动停止（秒，0 表示关闭）</span
+          ><select
+            v-model.number="draft.emergencyTimeoutSecs"
+            :disabled="locked || !isHost"
+          >
+            <option :value="0">0（关闭）</option>
+            <option :value="15">15</option>
+            <option :value="30">30</option>
+            <option :value="60">60</option>
+          </select></label
+        >
       </div>
       <div v-if="reservedShortcut" class="inline-info" role="alert">
         F12 是 Windows 保留键。请选择 Ctrl + Alt + F10 或 F9，保存后重新开始共享。
