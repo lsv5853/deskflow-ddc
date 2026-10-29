@@ -66,6 +66,11 @@ pub struct Config {
     /// trip (the hotkey channel keeps working).
     #[serde(default = "emergency_timeout_default")]
     pub emergency_timeout_secs: u64,
+    /// P0-2: the user explicitly acknowledged an `Unknown` engine-TCC
+    /// verdict. A `Denied` verdict can never be skipped with this flag.
+    /// Reset when the engine binary path changes (see `Runtime::save`).
+    #[serde(default)]
+    pub engine_tcc_acknowledged: bool,
     #[serde(default)]
     pub modifier_mapping: ModifierMapping,
     pub clipboard: bool,
@@ -96,6 +101,7 @@ impl Default for Config {
             shortcut: "control+alt+F10".into(),
             emergency_shortcut: emergency_shortcut_default(),
             emergency_timeout_secs: emergency_timeout_default(),
+            engine_tcc_acknowledged: false,
             modifier_mapping: ModifierMapping::Original,
             clipboard: true,
             clipboard_megabytes: 4,
