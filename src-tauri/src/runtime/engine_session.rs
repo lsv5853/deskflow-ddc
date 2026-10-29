@@ -1,5 +1,12 @@
 use super::*;
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl Runtime {
     pub(super) async fn start_engine(
         self: &Arc<Self>,
@@ -32,7 +39,22 @@ impl Runtime {
         let binary = self.binary(&c)?;
         let (tx, mut rx) = mpsc::channel(64);
         let (transitions, mut changes) = mpsc::channel(32);
-        let engine = Engine::start(binary.clone(), &c, &settings, &dir, tx).await?;
+        let engine = Engine::start(
+            binary.clone(),
+            &c,
+            &settings,
+            &dir,
+            &self.platform.resources,
+            tx,
+        )
+        .await?;
+        if !engine.emergency_watch_active() {
+            // The in-app Tauri emergency shortcut still works; only the
+            // separate watchdog process is missing.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            self.log("error", "独立紧急停止监听未能启动，仅应用内紧急快捷键可用")
+                .await;
+        }
         self.trace("engine.started", json!({"pid":engine.pid(),"guardianPid":engine.guardian_pid(),"parentPid":std::process::id(),"binary":binary,"session":link.id,"version":env!("CARGO_PKG_VERSION")})).await;
         *guard = Some(engine);
         {
@@ -43,6 +65,19 @@ impl Runtime {
         }
         self.publish();
         drop(guard);
+        // P0-1 heartbeat watchdog: every engine IPC/output event counts
+        // as activity (see emergency.rs for what it can and cannot prove).
+        // On trip, closing the session runs the existing session-end path,
+        // which stops the engine and restores local input.
+        let watchdog = Arc::new(std::sync::Mutex::new(crate::emergency::Watchdog::new(
+            c.emergency_timeout_secs,
+        )));
+        watchdog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .start(now_ms());
+        let watchdog_events = watchdog.clone();
+        let watchdog_tick = watchdog.clone();
         let this = self.clone();
         let context = link.clone();
         tokio::spawn(async move {
@@ -62,6 +97,10 @@ impl Runtime {
                 if !this.current(&context) {
                     break;
                 }
+                watchdog_events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .activity(now_ms());
                 match event {
                     engine::Event::Ipc(line) => {
                         if line == "observerDisconnected" {
@@ -135,6 +174,26 @@ impl Runtime {
                         context.session.close();
                         break;
                     }
+                }
+            }
+        });
+        let this = self.clone();
+        let context = link.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if !this.current(&context) {
+                    break;
+                }
+                let trip = watchdog_tick
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .tick(now_ms());
+                if trip.is_some() {
+                    this.log("error", "引擎心跳超时，已自动停止共享并恢复本地输入；若画面仍停在对端，请用显示器实体按键切回").await;
+                    context.session.close();
+                    break;
                 }
             }
         });
