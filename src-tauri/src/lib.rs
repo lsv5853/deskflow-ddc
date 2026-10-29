@@ -4,6 +4,7 @@ pub mod emergency;
 pub mod engine;
 #[cfg(target_os = "macos")]
 pub mod engine_guard;
+pub mod engine_tcc;
 pub mod model;
 pub mod platform;
 pub mod pointer;
