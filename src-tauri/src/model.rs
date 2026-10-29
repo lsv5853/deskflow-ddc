@@ -10,6 +10,12 @@ pub fn platform() -> &'static str {
         "unsupported"
     }
 }
+pub fn emergency_shortcut_default() -> String {
+    crate::emergency::EMERGENCY_SHORTCUT_DEFAULT.into()
+}
+pub fn emergency_timeout_default() -> u64 {
+    crate::emergency::EMERGENCY_TIMEOUT_DEFAULT_SECS
+}
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ModifierMapping {
@@ -52,6 +58,14 @@ pub struct Config {
     pub local_input: Option<u16>,
     pub peer_input: Option<u16>,
     pub shortcut: String,
+    /// Emergency-stop hotkey, independent of the engine's input path.
+    /// `#[serde(default)]` keeps configs saved by older versions readable.
+    #[serde(default = "emergency_shortcut_default")]
+    pub emergency_shortcut: String,
+    /// Engine heartbeat timeout in seconds. `0` disables the automatic
+    /// trip (the hotkey channel keeps working).
+    #[serde(default = "emergency_timeout_default")]
+    pub emergency_timeout_secs: u64,
     #[serde(default)]
     pub modifier_mapping: ModifierMapping,
     pub clipboard: bool,
@@ -80,6 +94,8 @@ impl Default for Config {
             local_input: None,
             peer_input: None,
             shortcut: "control+alt+F10".into(),
+            emergency_shortcut: emergency_shortcut_default(),
+            emergency_timeout_secs: emergency_timeout_default(),
             modifier_mapping: ModifierMapping::Original,
             clipboard: true,
             clipboard_megabytes: 4,
@@ -129,6 +145,18 @@ impl Config {
             regex::Regex::new(r"^control\+alt\+(shift\+)?F([1-9]|1[0-7])$")?
                 .is_match(&self.shortcut),
             "快捷键格式无效"
+        );
+        // The emergency hotkey shares the switch shortcut's syntax, but it
+        // must never collide with it or with the engine's return key.
+        crate::emergency::validate_emergency_hotkey(
+            &self.emergency_shortcut,
+            &self.shortcut,
+            platform() == "win32" && self.role == "host",
+        )
+        .map_err(anyhow::Error::msg)?;
+        ensure!(
+            self.emergency_timeout_secs <= 600,
+            "引擎心跳超时最多 600 秒（0 表示关闭自动停止）"
         );
         ensure!(
             ["off", "left", "right", "top", "bottom"].contains(&self.layout_side.as_str()),
