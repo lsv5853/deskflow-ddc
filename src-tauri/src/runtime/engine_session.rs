@@ -122,6 +122,11 @@ impl Runtime {
                                 let mut i = this.inner.lock().await;
                                 if this.current(&context) {
                                     i.state.engine = "ready".into();
+                                    // P0-2: a session that demonstrably
+                                    // captured input proves the engine grant
+                                    // for the rest of this app run.
+                                    i.engine_tcc.reached_ready = true;
+                                    i.engine_tcc.permission_error = false;
                                 }
                             }
                             this.publish();
@@ -154,7 +159,22 @@ impl Runtime {
                                 }
                             }
                         }
-                        if (lower.contains("failed")
+                        // P0-2: permission-class engine output is surfaced
+                        // distinctly instead of drowning in the generic
+                        // "check permissions" advice. The upstream clipboard
+                        // filter in engine.rs may drop lines mentioning
+                        // clipboard before they reach here; that filter is
+                        // intentionally left untouched (another audit item).
+                        if crate::engine_tcc::matches_permission_error(&line) {
+                            {
+                                let mut i = this.inner.lock().await;
+                                if this.current(&context) {
+                                    i.engine_tcc.permission_error = true;
+                                }
+                            }
+                            this.log("error", &format!("检测到引擎权限类错误：{line}"))
+                                .await;
+                        } else if (lower.contains("failed")
                             || lower.contains("cannot")
                             || lower.contains("error"))
                             && !lower.contains("screenbridge-probe")
