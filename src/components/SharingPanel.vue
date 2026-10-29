@@ -284,6 +284,50 @@ const emergencyShortcuts = computed(() => [
           打开系统设置
         </button>
       </div>
+      <div v-if="state.platform === 'darwin'" class="dependency-row">
+        <div>
+          <strong>引擎权限（deskflow-core）</strong>
+          <p>
+            检测内置引擎自己的输入监控授权，和上面本应用的授权是两回事；未授权时开始共享会被拦截，无法确定时需要你明确确认。
+            <span v-if="state.engineTcc.binaryPath">引擎文件：{{ state.engineTcc.binaryPath }}</span>
+          </p>
+          <p>
+            {{ state.engineTcc.detail
+            }}<span v-if="state.engineTcc.verdict === 'unknown' && !state.running"
+              >确认后请再点开始共享。</span
+            >
+          </p>
+        </div>
+        <span :class="['badge', state.engineTcc.verdict === 'granted' ? 'success' : 'neutral']">{{
+          state.engineTcc.verdict === 'granted'
+            ? '已授权'
+            : state.engineTcc.verdict === 'denied'
+              ? '未授权'
+              : state.engineTcc.verdict === 'unknown'
+                ? '无法确定'
+                : '不适用'
+        }}</span
+        ><button
+          class="button secondary compact"
+          :disabled="busy"
+          @click="emit('action', { type: 'checkAccessibility' })"
+        >
+          重新检测</button
+        ><button
+          class="button secondary compact"
+          :disabled="busy"
+          @click="emit('action', { type: 'openInputMonitoring' })"
+        >
+          打开输入监控设置</button
+        ><button
+          v-if="state.engineTcc.verdict === 'unknown' && !state.running"
+          class="button secondary compact"
+          :disabled="busy"
+          @click="emit('action', { type: 'acknowledgeEngineTcc' })"
+        >
+          我已了解，仍要开始
+        </button>
+      </div>
     </div>
   </section>
 </template>
