@@ -15,6 +15,7 @@ export interface Config {
   shortcut: string
   emergencyShortcut: string
   emergencyTimeoutSecs: number
+  engineTccAcknowledged: boolean
   modifierMapping: ModifierMapping
   clipboard: boolean
   clipboardMegabytes: number
@@ -87,6 +88,12 @@ export interface Snapshot {
   displayStatus?: 'uninitialized' | 'commanded' | 'uncertain'
   lastDisplayDeviceId?: string | null
   dependencies: { deskflow: boolean; displayControl: boolean; accessibility: boolean }
+  engineTcc: {
+    verdict: 'granted' | 'denied' | 'unknown' | 'notApplicable'
+    detail: string
+    binaryPath: string
+    appTrusted: boolean
+  }
   diagnostics: { directory: string; error: string | null }
   logs: LogEntry[]
   lastError: string | null
