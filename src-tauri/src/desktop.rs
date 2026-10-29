@@ -93,6 +93,10 @@ pub enum Action {
     CopyPairing {},
     OpenAccessibility {},
     CheckAccessibility {},
+    /// P0-2: explicitly acknowledge an `Unknown` engine-TCC verdict.
+    AcknowledgeEngineTcc {},
+    /// P0-2: open the Input Monitoring pane (macOS only).
+    OpenInputMonitoring {},
     OpenDataFolder {},
     ExportDiagnostics {},
     OpenLogFolder {},
@@ -174,6 +178,15 @@ async fn dispatch(app: &tauri::AppHandle, runtime: &Arc<Runtime>, action: Action
         Action::Stop {} => runtime.stop().await,
         Action::Discover {} => runtime.discover().await,
         Action::CheckAccessibility {} => runtime.check_accessibility().await,
+        Action::AcknowledgeEngineTcc {} => runtime.acknowledge_engine_tcc().await,
+        Action::OpenInputMonitoring {} => {
+            #[cfg(target_os = "macos")]
+            app.opener().open_url(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+                None::<&str>,
+            )?;
+            runtime.check_accessibility().await
+        }
         Action::RotatePairing {} => runtime.rotate_pairing().await,
         Action::CopyPairing {} => {
             app.clipboard()
