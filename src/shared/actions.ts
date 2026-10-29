@@ -18,6 +18,8 @@ export const actionSchema = z.discriminatedUnion('type', [
       'copyPairing',
       'openAccessibility',
       'checkAccessibility',
+      'acknowledgeEngineTcc',
+      'openInputMonitoring',
       'openDataFolder',
       'exportDiagnostics',
       'openLogFolder',
