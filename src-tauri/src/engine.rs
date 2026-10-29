@@ -1,4 +1,5 @@
 use crate::{
+    emergency,
     model::{Config, Identity},
     store::atomic_write,
 };
@@ -14,6 +15,8 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot},
 };
+#[cfg(target_os = "macos")]
+use tokio::io::AsyncBufReadExt;
 
 #[derive(Debug)]
 pub enum Event {
@@ -227,9 +230,131 @@ pub async fn assert_no_running_engine(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Separate emergency-hotkey watchdog process (P0-1).
+///
+/// The main app also registers the emergency hotkey through Tauri, but a
+/// wedged engine can swallow input before the app sees it. This process
+/// owns no engine state: it only watches for the chord and, on match,
+/// kills the engine after re-verifying its identity (PID + kernel start
+/// time on macOS, PID + start-time snapshot on Windows), then exits.
+/// The session ending normally ends the watcher too (stdin lease on
+/// macOS, parent liveness on Windows), so a clean quit never leaves a
+/// live watcher behind. On other platforms there is no separate watcher;
+/// the in-app Tauri shortcut and the peer-side stop remain the channels.
+pub struct EmergencyWatch {
+    child: Option<Child>,
+    lease: Option<tokio::process::ChildStdin>,
+}
+impl EmergencyWatch {
+    #[cfg(target_os = "macos")]
+    pub async fn start(
+        engine_pid: u32,
+        hotkey: &str,
+        resources: &Path,
+        _app_pid: u32,
+    ) -> Result<Option<Self>> {
+        // Exact kernel start time, same source as the exit-protection
+        // guardian: a recycled PID can never match it.
+        let (secs, micros) = crate::engine_guard::engine_start_time(engine_pid)?;
+        let mut command = Command::new(resources.join("native/bin/mac-hotkey"));
+        command
+            .args([
+                "watch",
+                &engine_pid.to_string(),
+                &secs.to_string(),
+                &micros.to_string(),
+                hotkey,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().context("无法启动紧急停止监听")?;
+        // Ready handshake, mirroring the guardian: a watcher whose tap
+        // never installs (for example missing accessibility permission)
+        // must not silently pretend to cover the session.
+        let output = child.stdout.take().context("紧急停止监听确认通道不可用")?;
+        let mut lines = tokio::io::BufReader::new(output).lines();
+        let ready = tokio::time::timeout(
+            Duration::from_secs(3),
+            lines.next_line(),
+        )
+        .await;
+        if !matches!(ready, Ok(Ok(Some(ref line))) if line == "ready") {
+            let _ = child.kill().await;
+            anyhow::bail!("紧急停止监听未就绪");
+        }
+        let lease = child.stdin.take();
+        Ok(Some(Self {
+            child: Some(child),
+            lease,
+        }))
+    }
+    #[cfg(target_os = "windows")]
+    pub async fn start(
+        engine_pid: u32,
+        hotkey: &str,
+        resources: &Path,
+        app_pid: u32,
+    ) -> Result<Option<Self>> {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(resources.join("native/monitor.ps1"))
+            .args([
+                "-Action",
+                "watch",
+                "-EnginePid",
+                &engine_pid.to_string(),
+                "-AppPid",
+                &app_pid.to_string(),
+                "-Hotkey",
+                hotkey,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .kill_on_drop(true);
+        let child = command.spawn().context("无法启动紧急停止监听")?;
+        Ok(Some(Self {
+            child: Some(child),
+            lease: None,
+        }))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub async fn start(
+        _engine_pid: u32,
+        _hotkey: &str,
+        _resources: &Path,
+        _app_pid: u32,
+    ) -> Result<Option<Self>> {
+        Ok(None)
+    }
+    /// End the watcher. Closing the stdin lease lets a macOS watcher exit
+    /// on its own; a leftover process is killed after a short grace.
+    pub async fn finish(mut self) {
+        drop(self.lease.take());
+        if let Some(mut child) = self.child.take() {
+            if tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+            }
+        }
+    }
+}
 pub struct Engine {
     pid: u32,
     guardian_pid: Option<u32>,
+    emergency_watch_active: bool,
     stop: mpsc::Sender<oneshot::Sender<Result<()>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -239,6 +364,7 @@ impl Engine {
         c: &Config,
         settings: &Path,
         dir: &Path,
+        resources: &Path,
         events: mpsc::Sender<Event>,
     ) -> Result<Self> {
         let temp = namespace(dir);
@@ -293,6 +419,22 @@ impl Engine {
         let guardian_pid = guardian.pid();
         #[cfg(not(target_os = "macos"))]
         let guardian_pid = None;
+        // Best-effort: if the separate watcher cannot start (for example
+        // a dev build without the native helper), the session still
+        // starts and the in-app Tauri shortcut remains available. The
+        // caller logs the degraded state.
+        let emergency_watch = match EmergencyWatch::start(
+            pid,
+            &c.emergency_shortcut,
+            resources,
+            std::process::id(),
+        )
+        .await
+        {
+            Ok(watch) => watch,
+            Err(_) => None,
+        };
+        let emergency_watch_active = emergency_watch.is_some();
         for pipe in [
             child
                 .stdout
@@ -345,8 +487,24 @@ impl Engine {
                         {
                             break;
                         }
+                        // P0-1 heartbeat source: re-send the exact
+                        // handshake already used at connect. A healthy
+                        // engine answers with a `hello=` line, which the
+                        // session loop counts as heartbeat activity for
+                        // the watchdog. No new protocol is invented here;
+                        // if a future Deskflow build stops answering,
+                        // raise the timeout or set it to 0 (hotkey only).
+                        let mut probe = tokio::time::interval(Duration::from_secs(
+                            emergency::EMERGENCY_PROBE_INTERVAL_SECS,
+                        ));
+                        probe.tick().await;
                         loop {
                             tokio::select! {
+                                _ = probe.tick() => {
+                                    if write.write_all(b"hello=screenbridge-probe\n").await.is_err() {
+                                        break;
+                                    }
+                                },
                                 line = lines.next() => {
                                     let Some(Ok(line)) = line else { break };
                                     if let Some(version)=line.strip_prefix("versionMismatch=") {
@@ -369,6 +527,7 @@ impl Engine {
             let _ = tx.send(Event::Ipc("observerDisconnected".into())).await;
         });
         let (stop, mut rx) = mpsc::channel::<oneshot::Sender<Result<()>>>(1);
+        let mut emergency_watch = emergency_watch;
         let task = tokio::spawn(async move {
             let guard_failed = async {
                 #[cfg(target_os = "macos")]
@@ -393,6 +552,12 @@ impl Engine {
             ipc_task.abort();
             #[cfg(target_os = "macos")]
             guardian.finish().await;
+            // Normal session end ends the emergency watcher too: the
+            // stdin lease closes (macOS) or the parent check fires
+            // (Windows), and leftovers are killed after a grace period.
+            if let Some(watch) = emergency_watch.take() {
+                watch.finish().await;
+            }
             // Deliver the exit event even under backpressure, independently of
             // the completed child/guardian cleanup awaited by application quit.
             tokio::spawn(async move {
@@ -402,12 +567,16 @@ impl Engine {
         Ok(Self {
             pid,
             guardian_pid,
+            emergency_watch_active,
             stop,
             task,
         })
     }
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+    pub fn emergency_watch_active(&self) -> bool {
+        self.emergency_watch_active
     }
     pub fn guardian_pid(&self) -> Option<u32> {
         self.guardian_pid
