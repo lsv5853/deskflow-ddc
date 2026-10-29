@@ -1,4 +1,4 @@
-param([ValidateSet('list','set','host','peer','pointer','screens','serve')][string]$Action = 'list', [string]$MonitorId = '', [int]$Value = 0, [int]$X = 0, [int]$Y = 0)
+param([ValidateSet('list','set','host','peer','pointer','screens','serve','watch')][string]$Action = 'list', [string]$MonitorId = '', [int]$Value = 0, [int]$X = 0, [int]$Y = 0, [int]$EnginePid = 0, [int]$AppPid = 0, [string]$Hotkey = '')
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
 Add-Type -TypeDefinition @'
@@ -99,6 +99,65 @@ public static class ScreenBridgeNative {
     }
     finally { if(previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
   }
+  // Emergency-stop watcher (P0-1). Installs its own low-level keyboard
+  // hook AFTER the engine starts, so it observes the emergency chord
+  // before the engine's hook can swallow it. On match it kills the
+  // engine only if its start time still equals the snapshot taken at
+  // watch start (PID reuse protection), then returns. It also exits
+  // when the owning app or the engine is gone. It never touches any
+  // other process. NOTE: hook ordering vs the engine's hook must be
+  // verified on real hardware; the in-app shortcut and peer-side stop
+  // remain fallbacks.
+  [StructLayout(LayoutKind.Sequential)] private struct KbdHook { public int vk; public int scan; public int flags; public int time; public UIntPtr extra; }
+  [StructLayout(LayoutKind.Sequential)] private struct Msg { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
+  private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", SetLastError=true)] private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+  [DllImport("user32.dll", SetLastError=true)] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+  [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] private static extern bool PeekMessage(out Msg lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+  public static bool WatchLoop(int enginePid, int appPid, int mods, int vk, long snapTicks) {
+    var down = new HashSet<int>();
+    bool fired = false;
+    HookProc proc = delegate(int nCode, IntPtr wParam, IntPtr lParam) {
+      if (nCode >= 0) {
+        int msg = wParam.ToInt32();
+        var k = (KbdHook)Marshal.PtrToStructure(lParam, typeof(KbdHook));
+        int code = k.vk;
+        if (msg == 0x0100 || msg == 0x0104) {
+          down.Add(code);
+          bool ctrl = down.Contains(0x11) || down.Contains(0xA2) || down.Contains(0xA3);
+          bool alt = down.Contains(0x12) || down.Contains(0xA4) || down.Contains(0xA5);
+          bool shift = down.Contains(0x10) || down.Contains(0xA0) || down.Contains(0xA1);
+          bool ok = true;
+          if ((mods & 1) != 0 && !ctrl) ok = false;
+          if ((mods & 2) != 0 && !alt) ok = false;
+          if ((mods & 4) != 0 && !shift) ok = false;
+          if (ok && code == vk) fired = true;
+        } else if (msg == 0x0101 || msg == 0x0105) {
+          down.Remove(code);
+        }
+      }
+      return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+    };
+    IntPtr hook = SetWindowsHookEx(13, proc, IntPtr.Zero, 0);
+    if (hook == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      while (true) {
+        Msg m;
+        while (PeekMessage(out m, IntPtr.Zero, 0, 0, 1)) { }
+        if (fired) {
+          try {
+            var p = System.Diagnostics.Process.GetProcessById(enginePid);
+            if (p.StartTime.ToFileTime() == snapTicks) { p.Kill(); }
+          } catch { }
+          return true;
+        }
+        try { System.Diagnostics.Process.GetProcessById(appPid); } catch { return false; }
+        try { System.Diagnostics.Process.GetProcessById(enginePid); } catch { return false; }
+        System.Threading.Thread.Sleep(50);
+      }
+    } finally { UnhookWindowsHookEx(hook); }
+  }
   public static void Hotkey(bool host) {
     ushort[] keys = {0x11, 0x12, 0x10, (ushort)(host ? 0x81 : 0x82)}; // Ctrl Alt Shift F18/F19
     var inputs = new List<Input>();
@@ -145,7 +204,31 @@ function Invoke-NativeCommand([string]$Command, [string]$Monitor, [int]$InputVal
   }
 }
 try {
-  if ($Action -eq 'serve') {
+  if ($Action -eq 'watch') {
+    # Emergency-stop watcher (P0-1). See ScreenBridgeNative.WatchLoop.
+    # Snapshot the engine start time first: the kill at trigger time
+    # only fires when it still matches, so a recycled PID is safe.
+    $engine = Get-Process -Id $EnginePid -ErrorAction Stop
+    $snap = $engine.StartTime.ToFileTime()
+    $mods = 0; $vk = 0
+    foreach ($part in ($Hotkey -split '\+')) {
+      switch ($part) {
+        'control' { $mods = $mods -bor 1 }
+        'alt' { $mods = $mods -bor 2 }
+        'shift' { $mods = $mods -bor 4 }
+        default {
+          if ($part -match '^F(\d+)$') {
+            $n = [int]$Matches[1]
+            if ($n -lt 1 -or $n -gt 24) { throw 'Invalid emergency hotkey' }
+            $vk = 0x70 + $n - 1
+          } else { throw 'Invalid emergency hotkey' }
+        }
+      }
+    }
+    if ($vk -eq 0) { throw 'Invalid emergency hotkey' }
+    [void][ScreenBridgeNative]::WatchLoop($EnginePid, $AppPid, $mods, $vk, $snap)
+    exit 0
+  } elseif ($Action -eq 'serve') {
     # Compile the native bindings once. Only read private stdin; EOF exits when
     # the owning app dies. Never evaluate request strings as PowerShell code.
     while ($null -ne ($line = [Console]::ReadLine())) {
