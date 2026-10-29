@@ -48,6 +48,7 @@ export const configSchema = z.preprocess(
         .regex(/^(control\+alt\+(shift\+)?)(F(?:[1-9]|1[0-7]))$/)
         .default('control+alt+shift+F11'),
       emergencyTimeoutSecs: z.number().int().min(0).max(600).default(15),
+      engineTccAcknowledged: z.boolean().default(false),
       modifierMapping: z.enum(['original', 'common']).default('original'),
       clipboard: z.boolean(),
       clipboardMegabytes: z.number().int().min(1).max(32),
@@ -86,6 +87,7 @@ export function defaultConfig(deviceName: string): Config {
     shortcut: 'control+alt+F10',
     emergencyShortcut: 'control+alt+shift+F11',
     emergencyTimeoutSecs: 15,
+    engineTccAcknowledged: false,
     modifierMapping: 'original',
     clipboard: true,
     clipboardMegabytes: 4,
