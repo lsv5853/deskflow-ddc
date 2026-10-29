@@ -43,6 +43,11 @@ export const configSchema = z.preprocess(
       localInput: z.number().int().min(0).max(65535).nullable(),
       peerInput: z.number().int().min(0).max(65535).nullable(),
       shortcut: z.string().regex(/^(control\+alt\+(shift\+)?)(F(?:[1-9]|1[0-7]))$/),
+      emergencyShortcut: z
+        .string()
+        .regex(/^(control\+alt\+(shift\+)?)(F(?:[1-9]|1[0-7]))$/)
+        .default('control+alt+shift+F11'),
+      emergencyTimeoutSecs: z.number().int().min(0).max(600).default(15),
       modifierMapping: z.enum(['original', 'common']).default('original'),
       clipboard: z.boolean(),
       clipboardMegabytes: z.number().int().min(1).max(32),
@@ -56,6 +61,8 @@ export const configSchema = z.preprocess(
     })
     .strict()
     .superRefine((c, ctx) => {
+      if (c.emergencyShortcut === c.shortcut)
+        ctx.addIssue({ code: 'custom', message: '紧急停止快捷键不能与切换快捷键相同' })
       if (c.controlPort === c.deskflowPort)
         ctx.addIssue({ code: 'custom', message: '控制端口和键鼠端口必须不同' })
       if (c.localInput !== null && c.localInput === c.peerInput)
@@ -77,6 +84,8 @@ export function defaultConfig(deviceName: string): Config {
     localInput: null,
     peerInput: null,
     shortcut: 'control+alt+F10',
+    emergencyShortcut: 'control+alt+shift+F11',
+    emergencyTimeoutSecs: 15,
     modifierMapping: 'original',
     clipboard: true,
     clipboardMegabytes: 4,
