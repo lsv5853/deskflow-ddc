@@ -399,6 +399,13 @@ fn sync_shortcuts(app: tauri::AppHandle, runtime: Arc<Runtime>) {
         let mut delay = Duration::from_secs(1);
         let mut retry = tokio::time::Instant::now();
         let mut wanted_before = String::new();
+        // P0-1 emergency shortcut: tracked independently of the switch
+        // shortcut, because the emergency case is exactly when the
+        // engine (and therefore the switch shortcut) is not usable.
+        let mut em_current = String::new();
+        let mut em_delay = Duration::from_secs(1);
+        let mut em_retry = tokio::time::Instant::now();
+        let mut em_wanted_before = String::new();
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
@@ -415,42 +422,89 @@ fn sync_shortcuts(app: tauri::AppHandle, runtime: Arc<Runtime>) {
                 retry = tokio::time::Instant::now();
                 delay = Duration::from_secs(1);
             }
-            if wanted.is_empty() || !current.is_empty() || tokio::time::Instant::now() < retry {
-                continue;
-            }
-            let rt = runtime.clone();
-            let registration =
-                app.global_shortcut()
-                    .on_shortcut(wanted.as_str(), move |_, _, event| {
-                        if event.state() == ShortcutState::Pressed {
-                            let rt = rt.clone();
-                            tauri::async_runtime::spawn(async move {
-                                if rt.shortcut().await.is_some() {
-                                    if let Err(e) = rt.toggle().await {
-                                        rt.log("error", &e.to_string()).await;
+            if !wanted.is_empty() && current.is_empty() && tokio::time::Instant::now() >= retry {
+                let rt = runtime.clone();
+                let registration =
+                    app.global_shortcut()
+                        .on_shortcut(wanted.as_str(), move |_, _, event| {
+                            if event.state() == ShortcutState::Pressed {
+                                let rt = rt.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    if rt.shortcut().await.is_some() {
+                                        if let Err(e) = rt.toggle().await {
+                                            rt.log("error", &e.to_string()).await;
+                                        }
                                     }
-                                }
-                            });
-                        }
-                    });
-            match registration {
-                Ok(()) => {
-                    current = wanted;
-                    delay = Duration::from_secs(1);
-                }
-                Err(e) => {
-                    if delay == Duration::from_secs(1) {
-                        runtime
-                            .log("error", &format!("快捷键注册失败，将自动重试：{e}"))
-                            .await;
+                                });
+                            }
+                        });
+                match registration {
+                    Ok(()) => {
+                        current = wanted;
+                        delay = Duration::from_secs(1);
                     }
-                    retry = tokio::time::Instant::now() + delay;
-                    delay = (delay * 2).min(Duration::from_secs(30));
+                    Err(e) => {
+                        if delay == Duration::from_secs(1) {
+                            runtime
+                                .log("error", &format!("快捷键注册失败，将自动重试：{e}"))
+                                .await;
+                        }
+                        retry = tokio::time::Instant::now() + delay;
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                }
+            }
+            let em_wanted = runtime.emergency_shortcut().await.unwrap_or_default();
+            if em_wanted != em_wanted_before {
+                if !em_current.is_empty() {
+                    let _ = app.global_shortcut().unregister(em_current.as_str());
+                    em_current.clear();
+                }
+                em_wanted_before = em_wanted.clone();
+                em_retry = tokio::time::Instant::now();
+                em_delay = Duration::from_secs(1);
+            }
+            if !em_wanted.is_empty()
+                && em_current.is_empty()
+                && tokio::time::Instant::now() >= em_retry
+            {
+                let rt = runtime.clone();
+                let registration =
+                    app.global_shortcut()
+                        .on_shortcut(em_wanted.as_str(), move |_, _, event| {
+                            if event.state() == ShortcutState::Pressed {
+                                let rt = rt.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    if rt.emergency_shortcut().await.is_some() {
+                                        if let Err(e) = rt.emergency_stop().await {
+                                            rt.log("error", &e.to_string()).await;
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                match registration {
+                    Ok(()) => {
+                        em_current = em_wanted;
+                        em_delay = Duration::from_secs(1);
+                    }
+                    Err(e) => {
+                        if em_delay == Duration::from_secs(1) {
+                            runtime
+                                .log("error", &format!("紧急快捷键注册失败，将自动重试：{e}"))
+                                .await;
+                        }
+                        em_retry = tokio::time::Instant::now() + em_delay;
+                        em_delay = (em_delay * 2).min(Duration::from_secs(30));
+                    }
                 }
             }
         }
         if !current.is_empty() {
             let _ = app.global_shortcut().unregister(current.as_str());
+        }
+        if !em_current.is_empty() {
+            let _ = app.global_shortcut().unregister(em_current.as_str());
         }
     });
 }
