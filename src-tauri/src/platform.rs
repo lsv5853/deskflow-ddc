@@ -124,6 +124,34 @@ impl Platform {
                 .await
                 .is_ok_and(|s| s == "true")
     }
+    /// P0-2 probe: run the engine binary with `--help` and scan its output
+    /// for permission-error signatures. This only proves the exact file that
+    /// would be launched actually executes; it NEVER proves a TCC grant, so
+    /// clean output leaves the verdict at `Unknown`. Only a permission
+    /// signature can move the verdict, to `Denied`. Returns `None` off
+    /// macOS, where the question does not apply.
+    pub async fn engine_probe(&self, binary: &std::path::Path) -> Option<bool> {
+        if platform() != "darwin" {
+            return None;
+        }
+        let mut cmd = tokio::process::Command::new(binary);
+        cmd.arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await;
+        let output = match output {
+            Ok(Ok(output)) => output,
+            // Spawn failure / timeout / non-UTF8 output: inconclusive, never
+            // a denial. A missing or broken binary is already covered by the
+            // `deskflow` dependency check.
+            _ => return Some(false),
+        };
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        Some(crate::engine_tcc::probe_found_permission_error(&combined))
+    }
     pub async fn list(&self) -> Result<Value> {
         if platform() == "win32" {
             let v = self.win("list", serde_json::json!({})).await?;
