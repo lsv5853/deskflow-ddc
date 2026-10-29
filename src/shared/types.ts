@@ -13,6 +13,8 @@ export interface Config {
   localInput: number | null
   peerInput: number | null
   shortcut: string
+  emergencyShortcut: string
+  emergencyTimeoutSecs: number
   modifierMapping: ModifierMapping
   clipboard: boolean
   clipboardMegabytes: number
