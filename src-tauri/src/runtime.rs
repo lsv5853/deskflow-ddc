@@ -7,6 +7,7 @@ use crate::{
     diagnostics::Diagnostics,
     discovery::{self, Device, Discovery},
     engine::{self, Engine},
+    engine_tcc::{self, EngineTccSignals},
     model::{platform, Config, Identity, ModifierMapping, Pin},
     platform::Platform,
     pointer::{self, Panel, Point},
@@ -83,6 +84,9 @@ pub struct Snapshot {
     pub pairing_code: String,
     pub has_saved_pairing: bool,
     pub dependencies: Dependencies,
+    /// P0-2: macOS engine-binary TCC verdict. Independent from
+    /// `dependencies.accessibility`, which only covers this app's helper.
+    pub engine_tcc: EngineTccReport,
     pub diagnostics: Value,
     pub logs: Vec<Log>,
     pub last_error: Option<String>,
@@ -121,6 +125,7 @@ impl Snapshot {
                 display_control: false,
                 accessibility: false,
             },
+            engine_tcc: EngineTccReport::unknown(false),
             diagnostics: json!({"directory":diagnostics.directory,"error":null}),
             logs: vec![],
             last_error: None,
@@ -175,12 +180,39 @@ pub struct Dependencies {
     pub display_control: bool,
     pub accessibility: bool,
 }
+
+/// P0-2 report serialized to the frontend. `verdict` is one of
+/// `granted` / `denied` / `unknown` / `notApplicable`; `binary_path` names
+/// the exact engine file the user must add in System Settings.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineTccReport {
+    pub verdict: String,
+    pub detail: String,
+    pub binary_path: String,
+    pub app_trusted: bool,
+}
+
+impl EngineTccReport {
+    fn unknown(app_trusted: bool) -> Self {
+        Self {
+            verdict: "unknown".into(),
+            detail: "尚未检测到引擎授权证据".into(),
+            binary_path: String::new(),
+            app_trusted,
+        }
+    }
+}
 struct Inner {
     store: Store,
     state: Snapshot,
     diagnostics: Diagnostics,
     sequence: u64,
     diagnostic_line: Option<(String, u64, std::time::Instant)>,
+    /// P0-2 signals accumulated this app run. Fresh on every launch, so a
+    /// new launch starts at `Unknown` until a session proves otherwise or
+    /// the user acknowledges the intercept.
+    engine_tcc: EngineTccSignals,
 }
 impl Inner {
     fn replace_pairing(&mut self, code: String) -> Result<()> {
@@ -252,6 +284,7 @@ impl Runtime {
                 diagnostics,
                 sequence: 0,
                 diagnostic_line: None,
+                engine_tcc: EngineTccSignals::default(),
             }),
             platform: Platform::new(resources),
             discovery: Mutex::new(None),
@@ -381,11 +414,102 @@ impl Runtime {
         self.publish();
         Ok(())
     }
+    /// P0-2: recompute the engine-TCC report. On macOS, resolves the engine
+    /// binary (best effort) and, while not running, runs the `--help` probe;
+    /// a permission signature in probe output marks the session signals as
+    /// denied. The probe can never grant: clean output leaves `Unknown`.
+    async fn compute_engine_tcc(&self) -> (engine_tcc::EngineTccVerdict, EngineTccReport) {
+        let snapshot = self.snapshot().await;
+        let app_trusted = snapshot.dependencies.accessibility;
+        if platform() != "darwin" {
+            return (
+                engine_tcc::EngineTccVerdict::NotApplicable,
+                EngineTccReport {
+                    verdict: "notApplicable".into(),
+                    detail: "当前系统不需要引擎授权检测".into(),
+                    binary_path: String::new(),
+                    app_trusted,
+                },
+            );
+        }
+        let binary_path = self
+            .binary(&snapshot.config)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !snapshot.running {
+            if let Ok(binary) = self.binary(&snapshot.config) {
+                if let Some(true) = self.platform.engine_probe(&binary).await {
+                    self.inner.lock().await.engine_tcc.permission_error = true;
+                }
+            }
+        }
+        let signals = self.inner.lock().await.engine_tcc;
+        let verdict = engine_tcc::decide(signals, true);
+        let detail = match verdict {
+            engine_tcc::EngineTccVerdict::Granted => {
+                "引擎已在本次运行中成功连接，输入监控授权正常".to_string()
+            }
+            engine_tcc::EngineTccVerdict::Denied => {
+                "检测到引擎权限类错误，请按向导手动添加引擎文件".to_string()
+            }
+            engine_tcc::EngineTccVerdict::Unknown => "尚未检测到引擎授权证据".to_string(),
+            engine_tcc::EngineTccVerdict::NotApplicable => unreachable!(),
+        };
+        (
+            verdict,
+            EngineTccReport {
+                verdict: verdict.as_str().into(),
+                detail,
+                binary_path,
+                app_trusted,
+            },
+        )
+    }
     pub async fn check_accessibility(&self) -> Result<()> {
         let trusted = self.platform.accessibility().await;
-        self.inner.lock().await.state.dependencies.accessibility = trusted;
+        let (_, report) = self.compute_engine_tcc().await;
+        let mut i = self.inner.lock().await;
+        i.state.dependencies.accessibility = trusted;
+        i.state.engine_tcc = report;
+        drop(i);
         self.publish();
         Ok(())
+    }
+    /// P0-2: explicit acknowledgement for an `Unknown` verdict. A `Denied`
+    /// verdict can never be skipped with this flag.
+    pub async fn acknowledge_engine_tcc(&self) -> Result<()> {
+        ensure!(!self.snapshot().await.running, "请先停止共享");
+        {
+            let mut i = self.inner.lock().await;
+            i.store.value.config.engine_tcc_acknowledged = true;
+            i.store.save()?;
+            i.state.config = i.store.value.config.clone();
+        }
+        self.log("info", "已确认在引擎授权状态无法确定时开始共享")
+            .await;
+        Ok(())
+    }
+    /// P0-2 start gate (macOS only). The app-level grant checked by the
+    /// caller does not cover the engine binary.
+    async fn engine_tcc_gate(&self, c: &Config) -> Result<()> {
+        if platform() != "darwin" {
+            return Ok(());
+        }
+        let (verdict, report) = self.compute_engine_tcc().await;
+        {
+            let mut i = self.inner.lock().await;
+            i.state.engine_tcc = report.clone();
+        }
+        self.publish();
+        match engine_tcc::gate(verdict, c.engine_tcc_acknowledged) {
+            engine_tcc::Gate::Allow => Ok(()),
+            engine_tcc::Gate::BlockDenied => {
+                bail!("{}", engine_tcc::wizard_text(&report.binary_path))
+            }
+            engine_tcc::Gate::BlockUnknown => {
+                bail!("{}", engine_tcc::intercept_text())
+            }
+        }
     }
     fn binary(&self, c: &Config) -> Result<PathBuf> {
         if c.deskflow_path.is_empty() {
@@ -398,10 +522,16 @@ impl Runtime {
     }
     pub async fn save(&self, c: Config) -> Result<()> {
         c.validate()?;
+        let mut c = c;
         {
             let mut i = self.inner.lock().await;
             ensure!(!i.state.running, "请先停止共享，再修改配置");
             let old = i.store.value.config.clone();
+            // P0-2: the acknowledgement is per engine binary. A different
+            // binary must prove (or be acknowledged) again.
+            if old.deskflow_path != c.deskflow_path {
+                c.engine_tcc_acknowledged = false;
+            }
             i.store.value.config = c.clone();
             if let Err(e) = i.store.save() {
                 i.store.value.config = old;
@@ -525,6 +655,8 @@ impl Runtime {
             state.dependencies.accessibility,
             "请先在系统设置中授予 Deskflow DDC 辅助功能权限，再点击检测"
         );
+        // P0-2: the app-level grant above does not cover the engine binary.
+        self.engine_tcc_gate(&c).await?;
         ensure!(
             c.retained_display_id.is_empty()
                 || pointer::selected(&state.cursor_displays, &c.retained_display_id).is_some(),
