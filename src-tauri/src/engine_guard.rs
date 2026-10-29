@@ -36,6 +36,14 @@ fn identity(pid: u32) -> Result<ProcessIdentity> {
     })
 }
 
+/// Kernel start time of a process, for identity-verified kills by the
+/// emergency watcher. Same source as the guardian: a recycled PID can
+/// never match the recorded start time.
+pub fn engine_start_time(pid: u32) -> Result<(u64, u64)> {
+    let id = identity(pid)?;
+    Ok((id.seconds, id.micros))
+}
+
 fn owned_parents(owner: u32, guard_parent: u32, engine_parent: u32) -> bool {
     // These kernel snapshots are not atomic: either sibling can be reparented
     // to launchd first when the owner exits. UID and exact engine start time
