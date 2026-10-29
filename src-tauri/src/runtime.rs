@@ -681,6 +681,14 @@ impl Runtime {
         self.publish();
         Ok(())
     }
+    /// Emergency stop (P0-1). Reachable from the emergency hotkey even
+    /// when the engine no longer forwards input: it reuses the normal
+    /// stop path, which kills the engine and restores local input.
+    pub async fn emergency_stop(&self) -> Result<()> {
+        self.log("error", "已触发紧急停止：正在结束键鼠引擎并恢复本地输入")
+            .await;
+        self.stop().await
+    }
     pub async fn export(&self) -> Result<Value> {
         let mut state = serde_json::to_value(self.snapshot().await)?;
         state["pairingCode"] = "[REDACTED]".into();
@@ -703,6 +711,17 @@ impl Runtime {
     }
     pub async fn data_directory(&self) -> PathBuf {
         self.inner.lock().await.store.directory.clone()
+    }
+    /// Emergency hotkey, available for the whole session (unlike the
+    /// switch shortcut, which needs a ready engine and an active device).
+    /// The emergency case is exactly when the engine is not ready.
+    pub async fn emergency_shortcut(&self) -> Option<String> {
+        let s = self.snapshot().await;
+        if s.running {
+            Some(s.config.emergency_shortcut)
+        } else {
+            None
+        }
     }
     pub async fn shortcut(&self) -> Option<String> {
         let s = self.snapshot().await;
